@@ -1,10 +1,12 @@
 package core
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -22,29 +24,40 @@ import (
 func TestParseStripeSignatureHeader(t *testing.T) {
 	t.Run("valid header", func(t *testing.T) {
 		header := "t=1234567890,v1=abcdef1234567890abcdef1234567890abcdef12"
-		ts, sig, err := parseStripeSignatureHeader(header)
+		ts, sigs, err := parseStripeSignatureHeader(header)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if ts != 1234567890 {
 			t.Fatalf("timestamp = %d, want 1234567890", ts)
 		}
-		if sig != "abcdef1234567890abcdef1234567890abcdef12" {
-			t.Fatalf("signature = %q", sig)
+		if len(sigs) != 1 || sigs[0] != "abcdef1234567890abcdef1234567890abcdef12" {
+			t.Fatalf("signatures = %q, want single signature", sigs)
 		}
 	})
 
-	t.Run("header with multiple v1 signatures picks first", func(t *testing.T) {
+	t.Run("header with multiple v1 signatures returns all", func(t *testing.T) {
 		header := "t=987654321,v1=firstsig,v1=secondsig"
-		ts, sig, err := parseStripeSignatureHeader(header)
+		ts, sigs, err := parseStripeSignatureHeader(header)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 		if ts != 987654321 {
 			t.Fatalf("timestamp = %d", ts)
 		}
-		if sig != "firstsig" {
-			t.Fatalf("signature = %q, want firstsig", sig)
+		if len(sigs) != 2 || sigs[0] != "firstsig" || sigs[1] != "secondsig" {
+			t.Fatalf("signatures = %q, want [firstsig secondsig]", sigs)
+		}
+	})
+
+	t.Run("header with duplicate v1 signatures dedupes", func(t *testing.T) {
+		header := "t=987654321,v1=firstsig,v1=firstsig"
+		_, sigs, err := parseStripeSignatureHeader(header)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(sigs) != 1 {
+			t.Fatalf("signatures = %q, want deduped to one", sigs)
 		}
 	})
 
@@ -95,7 +108,7 @@ func computeStripeSignature(timestamp int64, payload, secret string) string {
 func TestVerifyStripeWebhookSignature(t *testing.T) {
 	secret := "whsec_test_secret_key"
 	payload := `{"id":"evt_test","type":"payment_intent.succeeded","data":{"object":{"id":"pi_test","amount":1000}}}`
-	timestamp := int64(1700000000)
+	timestamp := time.Now().Unix()
 	correctSig := computeStripeSignature(timestamp, payload, secret)
 	header := fmt.Sprintf("t=%d,v1=%s", timestamp, correctSig)
 
@@ -113,6 +126,63 @@ func TestVerifyStripeWebhookSignature(t *testing.T) {
 		err := server.verifyStripeWebhookSignature([]byte(payload), wrongHeader)
 		if err == nil {
 			t.Fatal("expected error for wrong signature")
+		}
+	})
+
+	t.Run("stale timestamp rejected", func(t *testing.T) {
+		server := &Server{cfg: Config{StripeWebhookSecret: secret}}
+		staleTS := time.Now().Add(-6 * time.Minute).Unix()
+		staleSig := computeStripeSignature(staleTS, payload, secret)
+		h := fmt.Sprintf("t=%d,v1=%s", staleTS, staleSig)
+		err := server.verifyStripeWebhookSignature([]byte(payload), h)
+		if err == nil {
+			t.Fatal("expected error for stale timestamp")
+		}
+	})
+
+	t.Run("future timestamp rejected", func(t *testing.T) {
+		server := &Server{cfg: Config{StripeWebhookSecret: secret}}
+		futureTS := time.Now().Add(6 * time.Minute).Unix()
+		futureSig := computeStripeSignature(futureTS, payload, secret)
+		h := fmt.Sprintf("t=%d,v1=%s", futureTS, futureSig)
+		err := server.verifyStripeWebhookSignature([]byte(payload), h)
+		if err == nil {
+			t.Fatal("expected error for future timestamp")
+		}
+	})
+
+	t.Run("boundary timestamp within tolerance accepted", func(t *testing.T) {
+		server := &Server{cfg: Config{StripeWebhookSecret: secret}}
+		edgeTS := time.Now().Add(-4 * time.Minute).Unix()
+		edgeSig := computeStripeSignature(edgeTS, payload, secret)
+		h := fmt.Sprintf("t=%d,v1=%s", edgeTS, edgeSig)
+		err := server.verifyStripeWebhookSignature([]byte(payload), h)
+		if err != nil {
+			t.Fatalf("expected within-tolerance timestamp to pass, got: %v", err)
+		}
+	})
+
+	t.Run("multi-signature with one valid accepts", func(t *testing.T) {
+		// Simulates webhook-secret rotation: old key signs, header also carries
+		// a stale (non-matching) signature from the previous secret.
+		server := &Server{cfg: Config{StripeWebhookSecret: secret}}
+		validSig := computeStripeSignature(timestamp, payload, secret)
+		staleSig := computeStripeSignature(timestamp, payload, "whsec_old_secret")
+		h := fmt.Sprintf("t=%d,v1=%s,v1=%s", timestamp, staleSig, validSig)
+		err := server.verifyStripeWebhookSignature([]byte(payload), h)
+		if err != nil {
+			t.Fatalf("expected a valid signature among multiple to pass, got: %v", err)
+		}
+	})
+
+	t.Run("multi-signature all invalid rejects", func(t *testing.T) {
+		server := &Server{cfg: Config{StripeWebhookSecret: secret}}
+		sigA := computeStripeSignature(timestamp, payload, "whsec_old_secret_a")
+		sigB := computeStripeSignature(timestamp, payload, "whsec_old_secret_b")
+		h := fmt.Sprintf("t=%d,v1=%s,v1=%s", timestamp, sigA, sigB)
+		err := server.verifyStripeWebhookSignature([]byte(payload), h)
+		if err == nil {
+			t.Fatal("expected error when no signature matches")
 		}
 	})
 
@@ -1177,5 +1247,679 @@ func TestRecordStripeSettlement_RefundedDedup(t *testing.T) {
 	}
 	if result2.Status != "refunded" {
 		t.Fatalf("replay status = %q, want refunded", result2.Status)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the 5 CHANGES_REQUESTED review blockers:
+//   1) single settlement (no double mint)   2) amount/currency/ownership
+//   3) refund reversal/hold (idempotent)    4) signature recency + rotation
+//   5) atomic mutate+persist with rollback
+// ---------------------------------------------------------------------------
+
+// stripeSettlementTestStore returns a store configured for creating funded
+// projects (needs a repo factory + git workspace) and for HTTP webhook tests.
+func stripeSettlementTestStore(t *testing.T) (*Store, Config) {
+	t.Helper()
+	tempDir := t.TempDir()
+	cfg := Config{
+		TokenSymbol:       defaultTokenSymbol,
+		StatePath:         filepath.Join(tempDir, "state.json"),
+		PlatformFeeBps:    1000,
+		DevPaymentEnabled: true,
+		DevPaymentCode:    defaultDevPaymentCode,
+		GitHubOwner:       defaultGitHubOwner,
+		BountyRoot:        filepath.Join(tempDir, "bounties"),
+		SMTPFrom:          "noreply@mergeos.local",
+	}
+	store, err := NewStore(cfg, NewPaymentManager(cfg), NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return store, cfg
+}
+
+// settleStripeProjectForTest builds the exact "already settled" state that
+// CreateProject leaves behind: it calls the same createFundedProject code path
+// used by the synchronous payments.Verify verifier, so the ledger carries one
+// payment_verified + one token_mint + one project_reserve for the intent.
+func settleStripeProjectForTest(t *testing.T, store *Store, userID, intentID string) *Project {
+	t.Helper()
+	project, err := store.createFundedProject(context.Background(), userID, CreateProjectRequest{
+		Title:         "Stripe settled project",
+		ClientName:    "Stripe Client",
+		ClientEmail:   "stripe-settle@example.com",
+		Brief:         "Funded via Stripe.",
+		BudgetCents:   2000,
+		PaymentMethod: PaymentStripe,
+	}, "", nil, PaymentVerification{Provider: "stripe", Reference: intentID})
+	if err != nil {
+		t.Fatalf("createFundedProject: %v", err)
+	}
+	return project
+}
+
+// countStripeLedgerType counts ledger entries of a type whose reference or
+// account mentions the needle.
+func countStripeLedgerType(ledger []LedgerEntry, entryType, needle string) int {
+	n := 0
+	for _, e := range ledger {
+		if e.Type != entryType {
+			continue
+		}
+		if needle == "" || ledgerValueReferencesID(e.Reference, needle) ||
+		ledgerValueReferencesID(e.FromAccount, needle) ||
+		ledgerValueReferencesID(e.ToAccount, needle) {
+			n++
+		}
+	}
+	return n
+}
+
+// Problem 1: CreateProject already mints (payment_verified + token_mint +
+// project_reserve). A later payment_intent.succeeded webhook for the same
+// intent must NOT mint a second time — exactly one credit and one reserve.
+func TestStripeWebhook_SingleSettlementPerIntent(t *testing.T) {
+	store, cfg := stripeSettlementTestStore(t)
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Single Settlement",
+		Email:    "single-settle@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_single_settle"
+	project := settleStripeProjectForTest(t, store, auth.User.ID, intentID)
+
+	// Before: CreateProject produced exactly one credit mint + one reserve.
+	if got := countStripeLedgerType(store.ListLedger(), "token_mint", project.ID); got != 1 {
+		t.Fatalf("token_mint before = %d, want 1", got)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "project_reserve", project.ID); got != 1 {
+		t.Fatalf("project_reserve before = %d, want 1", got)
+	}
+
+	// After: webhook arrives for the already-settled intent.
+	server := NewServer(cfg, store, NewPaymentManager(cfg))
+	eventID := "evt_single_settle"
+	body := stripeSucceededPayload(eventID, intentID)
+	sigHeader := computeStripeHeader(body, cfg.StripeWebhookSecret)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", sigHeader)
+	server.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var result stripeSettlementResult
+	json.Unmarshal(rr.Body.Bytes(), &result)
+	if result.Status != "verified" {
+		t.Fatalf("Status = %q, want verified", result.Status)
+	}
+	if !result.Duplicate {
+		t.Fatalf("expected Duplicate=true when CreateProject already settled, got %t", result.Duplicate)
+	}
+
+	// Still exactly one credit (payment_verified or stripe_payment_verified)
+	// referencing the intent, one mint, and one reserve — no double mint.
+	credits := countStripeLedgerType(store.ListLedger(), "payment_verified", intentID) +
+		countStripeLedgerType(store.ListLedger(), "stripe_payment_verified", intentID)
+	if credits != 1 {
+		t.Fatalf("payment credits referencing intent = %d, want 1", credits)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "token_mint", project.ID); got != 1 {
+		t.Fatalf("token_mint after = %d, want 1", got)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "project_reserve", project.ID); got != 1 {
+		t.Fatalf("project_reserve after = %d, want 1", got)
+	}
+
+	// Retry: replaying the same event stays a no-op.
+	before := len(store.ListLedger())
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Stripe-Signature", sigHeader)
+	server.Routes().ServeHTTP(rr2, req2)
+	if rr2.Code != http.StatusOK {
+		t.Fatalf("replay status = %d", rr2.Code)
+	}
+	var replay stripeSettlementResult
+	json.Unmarshal(rr2.Body.Bytes(), &replay)
+	if !replay.Duplicate {
+		t.Fatal("replay should be duplicate")
+	}
+	if after := len(store.ListLedger()); after != before {
+		t.Fatalf("ledger length changed on replay: %d -> %d", before, after)
+	}
+}
+
+// Problem 2: a succeeded settlement whose amount does not match the project
+// budget must be rejected BEFORE any ledger change.
+func TestRecordStripeSettlement_AmountMismatchRejected(t *testing.T) {
+	cfg := testStripeConfig(t)
+	store, err := NewStore(cfg, NewPaymentManager(cfg), NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Amount Mismatch",
+		Email:    "amount-mismatch@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_amount_mismatch"
+	store.mu.Lock()
+	store.projects["prj_amount_mismatch"] = &Project{
+		ID:               "prj_amount_mismatch",
+		ClientUserID:     auth.User.ID,
+		Title:            "Amount mismatch",
+		PaymentStatus:    "pending",
+		PaymentProvider:  "stripe",
+		PaymentReference: intentID,
+		BudgetCents:      2000,
+		Status:           ProjectFunded,
+		CreatedAt:        time.Now().UTC(),
+	}
+	store.mu.Unlock()
+
+	_, err = store.RecordStripeSettlement("evt_amt_mismatch", stripeWebhookPayment{
+		PaymentIntentID: intentID,
+		AmountCents:     5000,
+		Currency:        "usd",
+		Status:          "succeeded",
+	})
+	if err == nil {
+		t.Fatal("expected error for amount mismatch")
+	}
+	store.mu.RLock()
+	ledgerLen := len(store.ledger)
+	status := store.projects["prj_amount_mismatch"].PaymentStatus
+	store.mu.RUnlock()
+	if ledgerLen != 0 {
+		t.Fatalf("ledger entries after rejected amount mismatch = %d, want 0", ledgerLen)
+	}
+	if status != "pending" {
+		t.Fatalf("project status changed to %q on rejected settlement", status)
+	}
+}
+
+// Problem 2: non-USD currency must be rejected before any ledger change.
+func TestRecordStripeSettlement_CurrencyMismatchRejected(t *testing.T) {
+	cfg := testStripeConfig(t)
+	store, err := NewStore(cfg, NewPaymentManager(cfg), NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Currency Mismatch",
+		Email:    "currency-mismatch@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_currency_mismatch"
+	store.mu.Lock()
+	store.projects["prj_currency_mismatch"] = &Project{
+		ID:               "prj_currency_mismatch",
+		ClientUserID:     auth.User.ID,
+		Title:            "Currency mismatch",
+		PaymentStatus:    "pending",
+		PaymentProvider:  "stripe",
+		PaymentReference: intentID,
+		BudgetCents:      2000,
+		Status:           ProjectFunded,
+		CreatedAt:        time.Now().UTC(),
+	}
+	store.mu.Unlock()
+
+	_, err = store.RecordStripeSettlement("evt_cur_mismatch", stripeWebhookPayment{
+		PaymentIntentID: intentID,
+		AmountCents:     2000,
+		Currency:        "eur",
+		Status:          "succeeded",
+	})
+	if err == nil {
+		t.Fatal("expected error for currency mismatch")
+	}
+	store.mu.RLock()
+	ledgerLen := len(store.ledger)
+	store.mu.RUnlock()
+	if ledgerLen != 0 {
+		t.Fatalf("ledger entries after rejected currency mismatch = %d, want 0", ledgerLen)
+	}
+}
+
+// chargeRefundedPayload builds a Stripe "charge.refunded" event (the real event
+// Stripe emits when a charge is refunded). The PaymentIntent id lives on the
+// charge's payment_intent field.
+func chargeRefundedPayload(eventID, intentID string, refundedCents int64) string {
+	return fmt.Sprintf(`{
+		"id": "%s",
+		"type": "charge.refunded",
+		"created": 1700000000,
+		"data": {
+			"object": {
+				"id": "ch_refund",
+				"object": "charge",
+				"payment_intent": "%s",
+				"amount": 2000,
+				"amount_refunded": %d,
+				"currency": "usd"
+			}
+		}
+	}`, eventID, intentID, refundedCents)
+}
+
+// refundCreatedPayload builds a Stripe "refund.created" event (object is a
+// Refund, which identifies its PaymentIntent via the payment_intent field).
+func refundCreatedPayload(eventID, refundID, intentID string, refundedCents int64) string {
+	return fmt.Sprintf(`{
+		"id": "%s",
+		"type": "refund.created",
+		"created": 1700000000,
+		"data": {
+			"object": {
+				"id": "%s",
+				"object": "refund",
+				"payment_intent": "%s",
+				"amount": %d,
+				"currency": "usd",
+				"status": "succeeded"
+			}
+		}
+	}`, eventID, refundID, intentID, refundedCents)
+}
+
+// Problem 3: a full Stripe refund must burn the minted MRG and release the held
+// project reserve — auditable via token_burn + project_reserve_release — and
+// be idempotent on replay.
+func TestStripeWebhook_FullRefundReversesSettlement(t *testing.T) {
+	store, cfg := stripeSettlementTestStore(t)
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Full Refund",
+		Email:    "full-refund@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_full_refund"
+	settleStripeProjectForTest(t, store, auth.User.ID, intentID)
+
+	server := NewServer(cfg, store, NewPaymentManager(cfg))
+	eventID := "evt_full_refund"
+	body := chargeRefundedPayload(eventID, intentID, 2000)
+	sigHeader := computeStripeHeader(body, cfg.StripeWebhookSecret)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", sigHeader)
+	server.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	var result stripeSettlementResult
+	json.Unmarshal(rr.Body.Bytes(), &result)
+	if result.Status != "refunded" {
+		t.Fatalf("Status = %q, want refunded", result.Status)
+	}
+	if result.Duplicate {
+		t.Fatal("first refund should not be duplicate")
+	}
+
+	// Auditable reversal: one burn + one reserve release referencing the intent.
+	if got := countStripeLedgerType(store.ListLedger(), "token_burn", intentID); got != 1 {
+		t.Fatalf("token_burn = %d, want 1", got)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "project_reserve_release", intentID); got != 1 {
+		t.Fatalf("project_reserve_release = %d, want 1", got)
+	}
+
+	// Project status flips to refunded.
+	var proj *Project
+	store.mu.RLock()
+	for _, p := range store.projects {
+		if p != nil && p.PaymentReference == intentID {
+			proj = p
+			break
+		}
+	}
+	store.mu.RUnlock()
+	if proj == nil {
+		t.Fatal("project not found")
+	}
+	if proj.PaymentStatus != "refunded" {
+		t.Fatalf("project PaymentStatus = %q, want refunded", proj.PaymentStatus)
+	}
+
+	// Replay: idempotent — no additional burn/reserve release.
+	before := len(store.ListLedger())
+	rr2 := httptest.NewRecorder()
+	req2 := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("Stripe-Signature", sigHeader)
+	server.Routes().ServeHTTP(rr2, req2)
+	var replay stripeSettlementResult
+	json.Unmarshal(rr2.Body.Bytes(), &replay)
+	if !replay.Duplicate {
+		t.Fatal("replay should be duplicate")
+	}
+	if after := len(store.ListLedger()); after != before {
+		t.Fatalf("ledger length changed on refund replay: %d -> %d", before, after)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "token_burn", intentID); got != 1 {
+		t.Fatalf("token_burn after replay = %d, want 1", got)
+	}
+}
+
+// Problem 3: partial refund reverses only the refunded portion, then a later
+// full refund reverses the remainder; a replayed lower refund is a no-op.
+func TestStripeWebhook_PartialRefundReversesProportional(t *testing.T) {
+	store, cfg := stripeSettlementTestStore(t)
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Partial Refund",
+		Email:    "partial-refund@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_partial_refund"
+	settleStripeProjectForTest(t, store, auth.User.ID, intentID)
+
+	server := NewServer(cfg, store, NewPaymentManager(cfg))
+	post := func(body string) stripeSettlementResult {
+		t.Helper()
+		sigHeader := computeStripeHeader(body, cfg.StripeWebhookSecret)
+		rr := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Stripe-Signature", sigHeader)
+		server.Routes().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+		}
+		var res stripeSettlementResult
+		json.Unmarshal(rr.Body.Bytes(), &res)
+		return res
+	}
+
+	// Partial refund of 800 cents.
+	res1 := post(refundCreatedPayload("evt_partial_1", "re_partial_1", intentID, 800))
+	if res1.Status != "refunded" || res1.Duplicate {
+		t.Fatalf("partial refund result = {status:%q duplicate:%t}", res1.Status, res1.Duplicate)
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "token_burn", intentID); got != 1 {
+		t.Fatalf("token_burn after partial = %d, want 1", got)
+	}
+	var proj *Project
+	store.mu.RLock()
+	for _, p := range store.projects {
+		if p != nil && p.PaymentReference == intentID {
+			proj = p
+			break
+		}
+	}
+	store.mu.RUnlock()
+	if proj.PaymentStatus != "partially_refunded" {
+		t.Fatalf("status after partial = %q, want partially_refunded", proj.PaymentStatus)
+	}
+
+	// Replay the same partial refund (new event id) — idempotent no-op.
+	resReplay := post(refundCreatedPayload("evt_partial_replay", "re_partial_1", intentID, 800))
+	if !resReplay.Duplicate {
+		t.Fatal("replayed partial refund should be duplicate")
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "token_burn", intentID); got != 1 {
+		t.Fatalf("token_burn after replay = %d, want 1", got)
+	}
+
+	// Full refund on top reverses the remaining 1200 cents.
+	res2 := post(chargeRefundedPayload("evt_partial_2", intentID, 2000))
+	if res2.Duplicate {
+		t.Fatal("full refund after partial should not be duplicate")
+	}
+	if got := countStripeLedgerType(store.ListLedger(), "token_burn", intentID); got != 2 {
+		t.Fatalf("token_burn after full = %d, want 2 (partial + remainder)", got)
+	}
+	store.mu.RLock()
+	for _, p := range store.projects {
+		if p != nil && p.PaymentReference == intentID {
+			proj = p
+			break
+		}
+	}
+	store.mu.RUnlock()
+	if proj.PaymentStatus != "refunded" {
+		t.Fatalf("status after full = %q, want refunded", proj.PaymentStatus)
+	}
+
+	// Sum of burns equals the full settled budget.
+	var burned int64
+	for _, e := range store.ListLedger() {
+		if e.Type == "token_burn" && ledgerValueReferencesID(e.Reference, intentID) {
+			burned += e.AmountCents
+		}
+	}
+	if burned != 2000 {
+		t.Fatalf("total burned = %d, want 2000", burned)
+	}
+}
+
+// Problem 3: stripeWebhookPaymentFromEvent maps the real Stripe refund events.
+func TestStripeWebhookPaymentFromEvent_RealRefundEvents(t *testing.T) {
+	t.Run("charge.refunded maps payment_intent", func(t *testing.T) {
+		var event stripeWebhookEvent
+		event.ID = "evt_charge_refunded"
+		event.Type = "charge.refunded"
+		event.Data.Object = stripeEventObject{
+			ID:             "ch_123",
+			PaymentIntent:  "pi_intent",
+			Amount:         2000,
+			AmountRefunded: 2000,
+			Currency:       "usd",
+		}
+		payment, err := stripeWebhookPaymentFromEvent(event)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if payment.PaymentIntentID != "pi_intent" {
+			t.Fatalf("PaymentIntentID = %q, want pi_intent", payment.PaymentIntentID)
+		}
+		if payment.AmountCents != 2000 {
+			t.Fatalf("AmountCents = %d, want 2000", payment.AmountCents)
+		}
+		if payment.Status != "refunded" {
+			t.Fatalf("Status = %q, want refunded", payment.Status)
+		}
+	})
+
+	t.Run("refund.created maps payment_intent", func(t *testing.T) {
+		var event stripeWebhookEvent
+		event.ID = "evt_refund_created"
+		event.Type = "refund.created"
+		event.Data.Object = stripeEventObject{
+			ID:            "re_123",
+			PaymentIntent: "pi_intent2",
+			Amount:        800,
+			Currency:      "usd",
+		}
+		payment, err := stripeWebhookPaymentFromEvent(event)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if payment.PaymentIntentID != "pi_intent2" {
+			t.Fatalf("PaymentIntentID = %q, want pi_intent2", payment.PaymentIntentID)
+		}
+		if payment.AmountCents != 800 {
+			t.Fatalf("AmountCents = %d, want 800", payment.AmountCents)
+		}
+	})
+
+	t.Run("refund.created without payment_intent falls back to object id", func(t *testing.T) {
+		var event stripeWebhookEvent
+		event.ID = "evt_refund_fb"
+		event.Type = "refund.created"
+		event.Data.Object = stripeEventObject{ID: "pi_fallback", Amount: 500, Currency: "usd"}
+		payment, err := stripeWebhookPaymentFromEvent(event)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if payment.PaymentIntentID != "pi_fallback" {
+			t.Fatalf("PaymentIntentID = %q, want pi_fallback", payment.PaymentIntentID)
+		}
+	})
+}
+
+// failingStripePersistence injects a persistence failure to exercise the
+// atomic mutate+persist rollback path (Problem 5).
+type failingStripePersistence struct{}
+
+func (failingStripePersistence) Load(ctx context.Context) (persistedState, bool, error) {
+	return persistedState{}, false, nil
+}
+func (failingStripePersistence) Save(ctx context.Context, state persistedState) error {
+	return errors.New("injected persistence failure")
+}
+func (failingStripePersistence) Close() error { return nil }
+
+// Problem 5: when persistence fails, the settlement must be rolled back —
+// no ledger entries, project status restored, and no dedup record left behind.
+func TestRecordStripeSettlement_PersistFailureRollsBackState(t *testing.T) {
+	cfg := testStripeConfig(t)
+	store, err := NewStore(cfg, NewPaymentManager(cfg), NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	auth, err := store.Register(RegisterRequest{
+		Name:     "Rollback",
+		Email:    "rollback@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_rollback"
+	store.mu.Lock()
+	store.projects["prj_rollback"] = &Project{
+		ID:               "prj_rollback",
+		ClientUserID:     auth.User.ID,
+		Title:            "Rollback test",
+		PaymentStatus:    "pending",
+		PaymentProvider:  "stripe",
+		PaymentReference: intentID,
+		BudgetCents:      2000,
+		Status:           ProjectFunded,
+		CreatedAt:        time.Now().UTC(),
+	}
+	store.mu.Unlock()
+
+	// Force persistence to fail on the next save.
+	store.mu.Lock()
+	store.storage = failingStripePersistence{}
+	store.mu.Unlock()
+
+	_, err = store.RecordStripeSettlement("evt_rollback", stripeWebhookPayment{
+		PaymentIntentID: intentID,
+		AmountCents:     2000,
+		Currency:        "usd",
+		Status:          "succeeded",
+	})
+	if err == nil {
+		t.Fatal("expected persistence error")
+	}
+
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	if len(store.ledger) != 0 {
+		t.Fatalf("ledger not rolled back on persistence failure: %d entries", len(store.ledger))
+	}
+	if store.projects["prj_rollback"].PaymentStatus != "pending" {
+		t.Fatalf("project status not restored on persistence failure: %q", store.projects["prj_rollback"].PaymentStatus)
+	}
+	if len(store.paymentSettlements) != 0 {
+		t.Fatalf("settlement dedup map not rolled back on persistence failure: %d", len(store.paymentSettlements))
+	}
+}
+
+// Problem 5: status mutations are persisted because they happen before the
+// snapshot — a reload must observe the verified status and card provider.
+func TestStripeWebhook_StatusPersistedAcrossReload(t *testing.T) {
+	cfg := testStripeConfig(t)
+	payments := NewPaymentManager(cfg)
+	store1, err := NewStore(cfg, payments, NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth, err := store1.Register(RegisterRequest{
+		Name:     "Persist Status",
+		Email:    "persist-status@example.com",
+		Password: "password123",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	intentID := "pi_persist_status"
+	store1.mu.Lock()
+	store1.projects["prj_persist_status"] = &Project{
+		ID:               "prj_persist_status",
+		ClientUserID:     auth.User.ID,
+		Title:            "Persist status",
+		PaymentStatus:    "pending",
+		PaymentProvider:  "stripe",
+		PaymentReference: intentID,
+		BudgetCents:      2000,
+		Status:           ProjectFunded,
+		CreatedAt:        time.Now().UTC(),
+	}
+	if err := store1.saveLocked(); err != nil {
+		store1.mu.Unlock()
+		t.Fatal(err)
+	}
+	store1.mu.Unlock()
+
+	server1 := NewServer(cfg, store1, payments)
+	body := stripeSucceededPayload("evt_persist_status", intentID)
+	sigHeader := computeStripeHeader(body, cfg.StripeWebhookSecret)
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/payments/stripe/webhook", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Stripe-Signature", sigHeader)
+	server1.Routes().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	store1.Close()
+
+	// Reopen — the project status change must have been persisted with the
+	// settlement (mutate-then-persist ordering, not the old save-then-mutate).
+	store2, err := NewStore(cfg, payments, NewRepoFactory(cfg), NewEmailSender(cfg))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store2.Close()
+	store2.mu.RLock()
+	proj := store2.projects["prj_persist_status"]
+	store2.mu.RUnlock()
+	if proj == nil {
+		t.Fatal("project not found after reload")
+	}
+	if proj.PaymentStatus != "verified" {
+		t.Fatalf("project PaymentStatus = %q after reload, want verified", proj.PaymentStatus)
+	}
+	if proj.PaymentProvider != "stripe:visa" {
+		t.Fatalf("project PaymentProvider = %q after reload, want stripe:visa", proj.PaymentProvider)
 	}
 }
